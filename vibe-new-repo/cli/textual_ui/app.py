@@ -774,33 +774,105 @@ class KKCodeApp(App):  # noqa: PLR0904
     def _create_preview_approval_callback(self):
         """Create an approval callback wrapper that shows preview diffs before approval.
 
-        Snapshot file saving is handled by SnapshotTurnContext in agent.py.
-        This wrapper only handles the UI concern of showing diffs.
+        This wraps the original approval callback to:
+        1. Check if the tool has a get_preview() method
+        2. Save CURRENT file state to snapshot directory (BEFORE modification)
+        3. Open a diff showing current vs proposed changes
+        4. Show the approval prompt
+        5. On APPROVAL: Keep snapshot backup (it's the BEFORE state we want!)
+        6. On REJECTION: Delete snapshot backup (we don't need it)
+
+        Returns:
+            An async callback function with the same signature as _approval_callback
         """
         async def preview_approval_wrapper(
             tool_name: str, args: BaseModel, tool_call_id: str
         ) -> tuple[ApprovalResponse, str | None]:
-            file_path_to_cleanup = None
+            file_path_to_cleanup = None  # Track preview file
+            snapshot_file_path = None  # Track snapshot backup file
 
-            # Try to show preview diff before approval
+            # Try to show preview diff and save snapshot backup before approval
             if self._diff_manager and self.agent:
                 try:
+                    # Get the tool instance from the agent's tool manager
                     tool_instance = self.agent.tool_manager.get(tool_name)
+
+                    # Check if the tool has a get_preview method
                     if hasattr(tool_instance, "get_preview"):
+                        # Call get_preview to generate the preview content
                         preview_result = await tool_instance.get_preview(args)
+
+                        # If preview was generated successfully, save to snapshot and show diff
                         if preview_result is not None:
+                            from pathlib import Path
+                            import shutil
+
                             file_path, preview_content = preview_result
                             file_path_to_cleanup = file_path
+
+                            # Save CURRENT file (BEFORE state) to snapshot directory
+                            if self.agent.snapshot_manager and file_path.exists():
+                                # Use the stored current user message index for consistency
+                                # This ensures files are saved to the correct snapshot directory
+                                if self.agent._current_user_message_index is not None:
+                                    user_message_index = self.agent._current_user_message_index
+                                    session_id = self.agent.session_id
+
+                                    # Create snapshot directory
+                                    from vibe.core.snapshots.constants import KKCODE_DIR_NAME, SNAPSHOT_DIR_NAME  #### KK-code altercation
+                                    snapshot_dir = self.config.effective_workdir / KKCODE_DIR_NAME / SNAPSHOT_DIR_NAME / session_id / f"msg-{user_message_index}"
+
+                                # Calculate relative path from workdir
+                                try:
+                                    rel_path = file_path.relative_to(self.config.effective_workdir)
+                                    snapshot_file_path = snapshot_dir / rel_path
+
+                                    # Create parent directories
+                                    snapshot_file_path.parent.mkdir(parents=True, exist_ok=True)
+
+                                    # Copy CURRENT file to snapshot (this is the BEFORE state)
+                                    shutil.copy2(file_path, snapshot_file_path)
+
+                                    logger.debug(f"Saved BEFORE state to snapshot: {snapshot_file_path}")
+                                except ValueError:
+                                    # File is outside workdir, skip snapshot
+                                    pass
+
+                            # Open the preview diff (current file vs proposed changes)
                             await self._diff_manager.open_preview_diff(
                                 file_path, preview_content
                             )
                 except Exception as e:
-                    logger.debug(f"Preview failed: {e}")
+                    logger.debug(f"Preview/snapshot failed: {e}")
+                    # If preview fails for any reason, just continue with normal approval
+                    pass
 
+            # Call the original approval callback to show the approval prompt
             result = await self._approval_callback(tool_name, args, tool_call_id)
+            approval_response, reason = result
 
+            # Handle cleanup based on approval/rejection
             if file_path_to_cleanup and self._diff_manager:
                 await self._diff_manager.cleanup_preview_file(file_path_to_cleanup)
+
+            # If REJECTED, delete the snapshot backup (we don't need it)
+            if approval_response == ApprovalResponse.NO and snapshot_file_path:
+                try:
+                    if snapshot_file_path.exists():
+                        snapshot_file_path.unlink()
+                        logger.debug(f"Deleted snapshot backup (rejected): {snapshot_file_path}")
+
+                        # Try to clean up empty directories
+                        try:
+                            snapshot_file_path.parent.rmdir()
+                            snapshot_file_path.parent.parent.rmdir()  # msg-N directory
+                        except OSError:
+                            pass  # Directory not empty
+                except Exception as e:
+                    logger.debug(f"Failed to delete snapshot backup: {e}")
+
+            # If APPROVED, keep the snapshot backup (it's the BEFORE state!)
+            # The tool will execute and modify the file, but we have the backup
 
             return result
 

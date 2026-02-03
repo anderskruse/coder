@@ -10,12 +10,10 @@ Snapshots are stored in the project's .kkcode/snapshots/ directory.
 """
 
 from vibe.core.snapshots.snapshot_manager import SnapshotManager
-from vibe.core.snapshots.turn_tracker import SnapshotTurnContext
 from vibe.core.snapshots.types import RestorePreview, SnapshotInfo
 
 __all__ = [
     "SnapshotManager",
-    "SnapshotTurnContext",
     "SnapshotInfo",
     "RestorePreview",
 ]

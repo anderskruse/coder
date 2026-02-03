@@ -2,46 +2,83 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
+import subprocess
 from pathlib import Path
 
 from vibe.core.snapshots.constants import KKCODE_DIR_NAME
+from vibe.core.utils import is_windows
 
 logger = logging.getLogger(__name__)
 
 
-def _snapshot_debug(msg: str) -> None:
-    """Write debug message to a dedicated file."""
-    try:
-        debug_file = Path.cwd() / ".kkcode" / "snapshot_debug.log"
-        debug_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(debug_file, "a", encoding="utf-8") as f:
-            from datetime import datetime
-            f.write(f"{datetime.now().isoformat()} {msg}\n")
-            f.flush()
-    except Exception:
-        pass
-
-
 async def get_project_files(workdir: Path, respect_gitignore: bool = True) -> list[str]:
-    """Get all project files using filesystem traversal.
+    """Get all project files, optionally respecting .gitignore.
 
     Args:
         workdir: Project working directory
-        respect_gitignore: Whether to also load .gitignore patterns
+        respect_gitignore: Whether to respect .gitignore (if git repo)
 
     Returns:
         List of relative file paths
     """
-    return await _get_files_manual(workdir, respect_gitignore)
+    if (workdir / ".git").exists() and respect_gitignore:
+        # Use git to respect .gitignore
+        return await _get_git_files(workdir)
+    else:
+        # Not a git repo or ignoring .gitignore - use manual traversal
+        return await _get_files_manual(workdir)
 
 
-async def _get_files_manual(workdir: Path, respect_gitignore: bool = True) -> list[str]:
-    """Get files manually, respecting ignore patterns."""
+async def _get_git_files(workdir: Path) -> list[str]:
+    """Get files using git (respects .gitignore)."""
+    try:
+        # Get tracked files
+        tracked_proc = await asyncio.create_subprocess_exec(
+            "git",
+            "ls-files",
+            cwd=workdir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL if is_windows() else None,
+        )
+        tracked_out, _ = await tracked_proc.communicate()
+
+        # Get untracked files (excluding ignored)
+        untracked_proc = await asyncio.create_subprocess_exec(
+            "git",
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            cwd=workdir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL if is_windows() else None,
+        )
+        untracked_out, _ = await untracked_proc.communicate()
+
+        files = set()
+        for line in tracked_out.decode("utf-8").split("\n"):
+            if line.strip():
+                files.add(line.strip())
+        for line in untracked_out.decode("utf-8").split("\n"):
+            if line.strip():
+                files.add(line.strip())
+
+        return sorted(files)
+
+    except Exception as e:
+        logger.warning(f"Failed to get git files, falling back to manual: {e}")
+        return await _get_files_manual(workdir)
+
+
+async def _get_files_manual(workdir: Path) -> list[str]:
+    """Get files manually, respecting .vibeignore."""
     files = []
-    ignore_patterns = _load_ignore_patterns(workdir, respect_gitignore)
+    ignore_patterns = _load_ignore_patterns(workdir)
 
     for item in workdir.rglob("*"):
         if item.is_file() or item.is_symlink():
@@ -53,13 +90,14 @@ async def _get_files_manual(workdir: Path, respect_gitignore: bool = True) -> li
 
             files.append(str(rel_path))
 
-    _snapshot_debug(f"[get_project_files] workdir={workdir}, found {len(files)} files")
     return sorted(files)
 
 
-def _load_ignore_patterns(workdir: Path, respect_gitignore: bool = True) -> list[str]:
-    """Load ignore patterns from .gitignore and .vibeignore files."""
-    # Default patterns — always applied
+def _load_ignore_patterns(workdir: Path) -> list[str]:
+    """Load ignore patterns from .vibeignore file."""
+    ignore_file = workdir / ".vibeignore"
+
+    # Default patterns
     patterns = [
         ".git/",
         f"{KKCODE_DIR_NAME}/",
@@ -78,25 +116,9 @@ def _load_ignore_patterns(workdir: Path, respect_gitignore: bool = True) -> list
         "Thumbs.db",
     ]
 
-    # Load .gitignore patterns directly (no git subprocess needed)
-    if respect_gitignore:
-        gitignore_file = workdir / ".gitignore"
-        if gitignore_file.exists():
-            try:
-                content = gitignore_file.read_text()
-                for line in content.split("\n"):
-                    line = line.strip()
-                    # Skip empty lines, comments, and negation patterns
-                    if line and not line.startswith("#") and not line.startswith("!"):
-                        patterns.append(line)
-            except Exception as e:
-                logger.warning(f"Failed to read .gitignore: {e}")
-
-    # Load .vibeignore patterns
-    vibeignore_file = workdir / ".vibeignore"
-    if vibeignore_file.exists():
+    if ignore_file.exists():
         try:
-            content = vibeignore_file.read_text()
+            content = ignore_file.read_text()
             for line in content.split("\n"):
                 line = line.strip()
                 if line and not line.startswith("#"):
@@ -109,29 +131,21 @@ def _load_ignore_patterns(workdir: Path, respect_gitignore: bool = True) -> list
 
 def _should_ignore(path: Path, patterns: list[str]) -> bool:
     """Check if path matches any ignore pattern."""
-    import fnmatch
-
     path_str = str(path)
 
     for pattern in patterns:
-        # Directory pattern (e.g., "build/", ".venv/")
+        # Directory pattern
         if pattern.endswith("/"):
-            dir_name = pattern.rstrip("/")
-            if any(part == dir_name for part in path.parts):
+            if any(part == pattern.rstrip("/") for part in path.parts):
                 return True
-        # Wildcard pattern (e.g., "*.pyc", "*.log")
+        # Wildcard pattern
         elif "*" in pattern:
-            # Match against the full relative path
+            import fnmatch
+
             if fnmatch.fnmatch(path_str, pattern):
                 return True
-            # Also match against just the filename
-            if fnmatch.fnmatch(path.name, pattern):
-                return True
-        # Exact match or prefix
+        # Exact match
         elif path_str == pattern or path_str.startswith(pattern + "/"):
-            return True
-        # Also check if any path component matches exactly
-        elif pattern in path.parts:
             return True
 
     return False
@@ -164,10 +178,6 @@ async def get_git_info(workdir: Path) -> dict[str, str | bool]:
     Returns:
         Dict with keys: commit, branch, dirty
     """
-    import asyncio
-
-    from vibe.core.utils import is_windows
-
     info = {"commit": None, "branch": None, "dirty": False}
 
     if not (workdir / ".git").exists():

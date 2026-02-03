@@ -93,22 +93,6 @@ class LLMResponseError(AgentError):
 logger = logging.getLogger(__name__)
 
 
-def _snapshot_debug(msg: str) -> None:
-    """Write debug message to a dedicated file that won't be swallowed by Textual."""
-    try:
-        debug_file = Path.cwd() / ".kkcode" / "snapshot_debug.log"
-        debug_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(debug_file, "a", encoding="utf-8") as f:
-            from datetime import datetime
-            f.write(f"{datetime.now().isoformat()} {msg}\n")
-            f.flush()
-    except Exception:
-        pass
-
-
-_snapshot_debug("[snapshot-debug] agent.py MODULE LOADED")
-
-
 class Agent:
     def __init__(
         self,
@@ -123,7 +107,6 @@ class Agent:
         session_id: str | None = None,  #### KK-code altercation: Allow reusing session ID when resuming
     ) -> None:
         """Initialize the agent with configuration and mode."""
-        _snapshot_debug(f"[snapshot-debug] Agent.__init__ CALLED, snapshot enabled={config.snapshot.enabled}")
         self.config = config
         self._mode = mode
         self._max_turns = max_turns
@@ -311,23 +294,24 @@ class Agent:
     #### KK-code altercation END ####
 
     async def _conversation_loop(self, user_msg: str) -> AsyncGenerator[BaseEvent]:
-        _snapshot_debug(f"[snapshot-debug] _conversation_loop CALLED, user_msg={user_msg[:80]!r}")
         #### KK-code altercation: Snapshot creation now happens during approval callback, not here
         self.messages.append(LLMMessage(role=Role.user, content=user_msg))
         self.stats.steps += 1
-        
+
         # Track current user message index for snapshot consistency
         # This ensures files are saved to the correct snapshot directory
         self._current_user_message_index = self._get_user_message_index() - 1
 
-        # Initialize snapshot turn context (tracks files tools touch, no project scanning)
-        self._snapshot_ctx = None
+        # Capture file list before the turn so we can detect newly created files
+        files_before_turn: set[str] = set()
         if self.snapshot_manager:
-            from vibe.core.snapshots.turn_tracker import SnapshotTurnContext
-            self._snapshot_ctx = SnapshotTurnContext(
-                self.snapshot_manager, self.config.effective_workdir,
-                self.session_id, user_msg, self._current_user_message_index,
-            )
+            try:
+                from vibe.core.snapshots.file_utils import get_project_files as _get_proj_files
+                files_before_turn = set(await _get_proj_files(self.config.effective_workdir, True))
+                logger.info(f"[snapshot-debug] files_before_turn captured: {len(files_before_turn)} files")
+            except Exception as e:
+                logger.warning(f"[snapshot-debug] files_before_turn FAILED: {e}")
+                pass
 
         try:
             should_break_loop = False
@@ -367,9 +351,119 @@ class Agent:
 
         finally:
             self._flush_new_messages()
-            #### KK-code altercation: finalize snapshot (all logic in turn_tracker) ####
-            if self._snapshot_ctx:
-                await self._snapshot_ctx.finalize(self.tool_manager)
+
+            #### KK-code altercation BEGIN ####
+            # Create snapshot metadata for every user message
+            # This allows restoring chat history even without file changes
+            # Files are saved directly to snapshot dir during approval callback
+            if self.snapshot_manager:
+                try:
+                    from datetime import datetime
+                    from uuid import uuid4
+
+                    # Count only USER messages for snapshot numbering
+                    user_message_index = self._get_user_message_index() - 1  # -1 because we already appended the user message
+                    session_id = self.session_id
+                    from vibe.core.snapshots.constants import KKCODE_DIR_NAME, SNAPSHOT_DIR_NAME  #### KK-code altercation
+                    snapshot_dir = self.config.effective_workdir / KKCODE_DIR_NAME / SNAPSHOT_DIR_NAME / session_id / f"msg-{user_message_index}"
+
+                    # Ensure snapshot directory exists (even for chat-only snapshots)
+                    snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+                    # Scan directory to find which files were already saved (by approval callback)
+                    saved_files = []
+                    total_size = 0
+                    for snapshot_file in snapshot_dir.rglob("*"):
+                        if snapshot_file.is_file() and snapshot_file.name != ".snapshot_metadata.json":
+                            rel_path = snapshot_file.relative_to(snapshot_dir)
+                            saved_files.append(str(rel_path))
+                            total_size += snapshot_file.stat().st_size
+
+                    # Get current project files (used for both new-file detection and snapshot metadata)
+                    from vibe.core.snapshots.file_utils import get_project_files
+                    all_project_files = await get_project_files(self.config.effective_workdir, True)
+
+                    # Detect newly created files by comparing against files_before_turn.
+                    # The approval callback only saves BEFORE state of existing files;
+                    # files created during the turn are missed because file_path.exists()
+                    # was False at approval time.
+                    created_files: list[str] = []
+                    if files_before_turn:
+                        import shutil as _shutil
+                        saved_files_set = set(saved_files)
+                        new_files = set(all_project_files) - files_before_turn
+                        for rel_path_str in new_files:
+                            created_files.append(rel_path_str)
+                            # Also save created files to snapshot dir so they can
+                            # be restored if a LATER restore needs them back
+                            if rel_path_str not in saved_files_set:
+                                src = self.config.effective_workdir / rel_path_str
+                                if src.exists() and src.is_file():
+                                    try:
+                                        dest = snapshot_dir / rel_path_str
+                                        dest.parent.mkdir(parents=True, exist_ok=True)
+                                        _shutil.copy2(src, dest)
+                                        saved_files.append(rel_path_str)
+                                        total_size += src.stat().st_size
+                                    except Exception:
+                                        pass
+
+                    # Get current plan/todo state
+                    plan_todos = []
+                    plan_count = 0
+                    try:
+                        todo_tool = self.tool_manager.get("todo")
+                        plan_todos = [todo.model_dump() for todo in todo_tool.state.todos]
+                        plan_count = len(plan_todos)
+                    except Exception:
+                        # If todo tool is not available, that's fine - just continue
+                        pass
+
+                    # Use the stored current user message index for consistency
+                    # This ensures metadata matches the files saved during approval
+                    if self._current_user_message_index is not None:
+                        user_message_index = self._current_user_message_index
+                    else:
+                        # Fallback to calculation if not set (shouldn't happen in normal flow)
+                        user_message_index = self._get_user_message_index() - 1
+
+                    # Always create metadata (even without files - for chat-only restore)
+                    from vibe.core.snapshots.types import SnapshotInfo
+
+                    snapshot = SnapshotInfo(
+                        snapshot_id=str(uuid4()),
+                        session_id=session_id,
+                        message_index=user_message_index,
+                        user_question=user_msg[:150],
+                        timestamp=datetime.now().isoformat(),
+                        snapshot_path=str(snapshot_dir),
+                        created_files=sorted(created_files),  # Files created during this turn
+                        modified_files=saved_files,  # Files modified/created by AI (saved in snapshot dir)
+                        git_commit=None,
+                        git_branch=None,
+                        git_was_dirty=False,
+                        total_size_bytes=total_size,
+                        file_count=len(saved_files),
+                        plan_todos=plan_todos,  # Save current plan state
+                        plan_count=plan_count,  # Number of todo items
+                    )
+
+                    # Write metadata atomically
+                    meta_file = snapshot_dir / ".snapshot_metadata.json"
+                    tmp_file = meta_file.with_suffix(".json.tmp")
+                    tmp_file.write_text(snapshot.model_dump_json(indent=2), encoding="utf-8")
+                    tmp_file.rename(meta_file)
+
+                    # Add to snapshot manager's list
+                    self.snapshot_manager.snapshots.append(snapshot)
+                    if saved_files:
+                        logger.info(f"Created snapshot {user_message_index} with {len(saved_files)} file(s)")
+                    else:
+                        logger.info(f"Created snapshot {user_message_index} (chat only)")
+                except Exception as e:
+                    logger.warning(f"Failed to create snapshot metadata: {e}")
+                    # Continue even if snapshot fails
+            #### KK-code altercation END ####
 
             await self.interaction_logger.save_interaction(
                 self.messages, self.stats, self.config, self.tool_manager, self.snapshot_manager  #### KK-code altercation
@@ -526,13 +620,11 @@ class Agent:
             self.stats.tool_calls_agreed += 1
 
             try:
-                #### KK-code altercation: track file before-state for snapshots ####
-                if self._snapshot_ctx and hasattr(tool_instance, 'get_preview'):
-                    await self._snapshot_ctx.track_file(tool_instance, tool_call.validated_args)
-
                 start_time = time.perf_counter()
                 result_model = await tool_instance.invoke(**tool_call.args_dict)
                 duration = time.perf_counter() - start_time
+
+                #### KK-code altercation: Removed file tracking (files saved directly during approval)
 
                 text = "\n".join(
                     f"{k}: {v}" for k, v in result_model.model_dump().items()
